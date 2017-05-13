@@ -620,6 +620,7 @@
                                     "Action": [
                                         "dynamodb:GetItem",
                                         "dynamodb:PutItem",
+                                        "dynamodb:UpdateItem",
                                         "dynamodb:DeleteItem",
                                         "dynamodb:Scan"
                                     ],
@@ -647,6 +648,7 @@
                                     "Effect": "Allow",
                                     "Action": [
                                         "ec2:CreateSnapshot",
+                                        "ec2:CopySnapshot",
                                         "ec2:CreateTags",
                                         "ec2:DeleteSnapshot",
                                         "ec2:DescribeSnapshots",

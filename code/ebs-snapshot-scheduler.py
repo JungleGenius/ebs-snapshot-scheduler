@@ -23,7 +23,7 @@ ec2_client = boto3.client('ec2')
 cf_client = boto3.client('cloudformation')
 
 
-def backup_instance(ec2, instance_obj, retention_days, history_table, aws_region):
+def backup_instance(ec2, instance_obj, retention_days, history_table, aws_region, copy_to_aws_region):
     new_snapshot_list = []
     for volume in instance_obj.volumes.all():
         current_time = datetime.datetime.utcnow()
@@ -39,6 +39,12 @@ def backup_instance(ec2, instance_obj, retention_days, history_table, aws_region
         else:
             purge_time = retention_days
 
+        # If copy_to_aws_region value is none set copy_to_status as complete else pending
+        if copy_to_aws_region == "none":
+            copy_to_status = "completed"
+        else:
+            copy_to_status = "pending"
+        
         # schedule snapshot creation.
         try:
             snapshot = ec2.create_snapshot(
@@ -51,7 +57,9 @@ def backup_instance(ec2, instance_obj, retention_days, history_table, aws_region
                 'volume_id': volume.id,
                 'size': volume.size,
                 'purge_time': str(purge_time),
-                'start_time': str(current_time)
+                'start_time': str(current_time),
+                'copy_to_aws_region': copy_to_aws_region,
+                'copy_to_status': copy_to_status
             }
 
             response = history_table.put_item(Item=snapshot_entry)
@@ -64,6 +72,83 @@ def backup_instance(ec2, instance_obj, retention_days, history_table, aws_region
 
 def parse_date(dt_string):
     return datetime.datetime.strptime(dt_string, '%Y-%m-%d %H:%M:%S.%f')
+
+
+def copy_snapshots(history_table, aws_region):
+
+    try:
+        history = history_table.scan()
+        copy_snapshot_list = []
+
+        for entry in history['Items']:
+            if entry['copy_to_status'] == "pending" and entry['region'] == aws_region:
+                snapshot_id = entry['snapshot_id']
+                copy_to_aws_region = entry['copy_to_aws_region']
+                print "snapshot pending: ", snapshot_id
+
+                try:
+                    ec2_resource_local = boto3.resource('ec2', region_name=aws_region)
+                    snapshot = ec2_resource_local.Snapshot(snapshot_id)
+                    if snapshot.state == "completed":
+                        print "snapshot state ", snapshot.state
+                        print "snapshot description ", snapshot.description
+
+                        ec2_client_local = boto3.client('ec2', region_name=copy_to_aws_region)
+                        copy_snapshot_response = ec2_client_local.copy_snapshot(
+                                                                   SourceSnapshotId=snapshot_id,
+                                                                   SourceRegion=aws_region,
+                                                                   DestinationRegion=copy_to_aws_region,
+                                                                   Description=snapshot.description)
+                        
+                        if copy_snapshot_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                            print "snapshot copied: ", snapshot_id
+                            copy_snapshot_list.append(snapshot_id)
+                            new_snapshot_id = copy_snapshot_response['SnapshotId']
+                            new_instance_id = entry['instance_id']
+                            # new_volume_id = entry['volume_id']
+                            new_volume_id = "vol-ffffffff"
+                            new_size = entry['size']
+                            new_purge_time = entry['purge_time']
+                            new_copy_to_aws_region = "none"
+                            new_copy_to_status = "completed"
+                            current_time = datetime.datetime.utcnow()
+                            new_snapshot_entry = {
+                                'snapshot_id': new_snapshot_id,
+                                'region': copy_to_aws_region,
+                                'instance_id': new_instance_id,
+                                'volume_id': new_volume_id,
+                                'size': new_size,
+                                'purge_time': new_purge_time,
+                                'start_time': str(current_time),
+                                'copy_to_aws_region': new_copy_to_aws_region,
+                                'copy_to_status': new_copy_to_status
+                            }
+                            new_snapshot_entry_response = history_table.put_item(
+                                                                                Item=new_snapshot_entry,
+                                                                                ConditionExpression='attribute_not_exists(snapshot_id)')
+                            if new_snapshot_entry_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                                response = history_table.update_item(
+                                                                    Key={'snapshot_id': snapshot_id},
+                                                                    UpdateExpression='SET copy_to_status = :val',
+                                                                    ExpressionAttributeValues={':val': new_copy_to_status})
+                                if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                                    print "Copy snapshot completed new id: ", new_snapshot_id
+                                                    
+                except Exception as e:
+                    print e
+                    continue
+
+        items_copied = len(copy_snapshot_list)
+
+        if items_copied > 0:
+            print "History table updated: snapshot copied added:", items_copied
+
+        if len(copy_snapshot_list) > 0:
+            print "List of snapshots copied:", copy_snapshot_list
+        return len(copy_snapshot_list)
+    except Exception as e:
+        print e
+        pass
 
 
 def purge_history(ec2, snapshots, history_table, aws_region):
@@ -114,6 +199,7 @@ def purge_history(ec2, snapshots, history_table, aws_region):
     except Exception as e:
         print e
         pass
+
 
 def is_int(s):
     try:
@@ -273,7 +359,16 @@ def lambda_handler(event, context):
                     for t in i.tags:
                         if t['Key'][:custom_tag_length] == custom_tag_name:
                             tag = t['Value']
-
+                            
+                            key_str = t['Key']
+                            pkey = key_str.split(";")
+                            copy_to_aws_region = "none"
+                            
+                            # If length is 2, possible values can be aws_region.
+                            if len(pkey) == 2:
+                                if pkey[1].lower() != aws_region and pkey[1].lower() in ([region_name['RegionName'] for region_name in aws_regions]):
+                                    copy_to_aws_region = pkey[1]
+                        
                             # Split out Tag & Set Variables to default
                             default1 = 'default'
                             default2 = 'true'
@@ -310,12 +405,20 @@ def lambda_handler(event, context):
                                             active_day is True:
                                 snapshot_list.append(i.instance_id)
                                 retention_period_per_instance[i.instance_id] = retention_days
+
             deleted_snapshot_count = 0
+            copied_snapshot_count = 0
+
+            for snap in ec2_resource.snapshots.filter(OwnerIds=['self']):
+                snapshots.append(snap.id)
+
+            copied_snapshot_count = copy_snapshots(history_table, aws_region)
+            if copied_snapshot_count > 0:
+                print "Number of snapshots copied successfully:", copied_snapshot_count
+                copied_snapshot_count = 0
 
             if auto_snapshot_deletion == "yes":
                 # Purge snapshots that are scheduled for deletion and snapshots that were manually deleted by users.
-                for snap in ec2_resource.snapshots.filter(OwnerIds=['self']):
-                    snapshots.append(snap.id)
                 deleted_snapshot_count = purge_history(ec2_resource, snapshots, history_table, aws_region)
                 if deleted_snapshot_count > 0:
                     print "Number of snapshots deleted successfully:", deleted_snapshot_count
@@ -331,7 +434,7 @@ def lambda_handler(event, context):
                         for key, value in retention_period_per_instance.iteritems():
                             if key == instance.id:
                                 retention_days = value
-                    new_snapshots = backup_instance(ec2_resource, instance, retention_days, history_table, aws_region)
+                    new_snapshots = backup_instance(ec2_resource, instance, retention_days, history_table, aws_region, copy_to_aws_region)
                     return_snapshot_list = new_snapshots
                     agg_snapshot_list.extend(return_snapshot_list)
                 print "Number of new snapshots created:", len(agg_snapshot_list)
